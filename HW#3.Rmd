@@ -1,0 +1,312 @@
+---
+title: "HW#3"
+author: "Andrew Clyde worked"
+date: "2/8/2021"
+output: html_document
+---
+
+```{r LM, echo=TRUE}
+library(pacman)
+
+p_load(tidyverse, modeldata, skimr, janitor,
+       kknn, tidymodels, magrittr, AER, tune, glmnet)
+
+#Read data
+housing_df = read_csv("train.csv")
+submit_df = read_csv("test.csv")
+
+#Clean names 
+housing_df %<>% clean_names()
+submit_df %<>% clean_names()
+
+#Create recipe
+housing_recipe = recipe(sale_price ~ id + lot_area + overall_qual 
+  + overall_cond + year_built + gr_liv_area + 
+  fence + year_remod_add + exter_qual + foundation + 
+  garage_area, data = housing_df) %>% 
+  update_role(id, new_role = "ID")
+
+#Clean the data
+housing_clean = housing_recipe %>%
+step_knnimpute(all_predictors(), neighbors = 10) %>%
+step_dummy(all_predictors() & all_nominal()) %>%
+step_interact(~gr_liv_area:all_predictors()) %>%
+prep() %>% juice()
+
+#Split the data
+set.seed(281312)
+housing_split = initial_split(housing_clean)
+
+#Create testing and training data
+housing_train = training(housing_split)
+housing_test = testing(housing_split)
+
+#Fit model
+est_reg = 
+  linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ . -id, data = housing_train)
+
+#Predict
+y_hat = predict(est_reg, housing_test)
+
+# Clean submission set so it works this time
+submission_recipe = recipe(id ~ + lot_area + overall_qual 
+  + overall_cond + year_built + gr_liv_area + 
+  fence + year_remod_add + exter_qual + foundation + 
+  garage_area, data = submit_df) %>% 
+  update_role(id, new_role = "ID")
+
+#Clean the data
+submit_clean = submission_recipe %>%
+step_knnimpute(all_predictors(), neighbors = 10) %>%
+step_dummy(all_predictors() & all_nominal()) %>%
+step_interact(~gr_liv_area:all_predictors()) %>%
+prep() %>% juice()
+
+#Create submission set 
+prediction_lm = predict(object = est_reg, new_data = submit_clean)
+
+# Create the submission dataset
+submit_lm = data.frame(
+    Id = submit_clean$id,
+    SalePrice = prediction_lm$.pred)
+
+# Write the file
+write_csv(x = submit_lm, file = "Andy-C-submit_lm.csv")
+```
+
+# Lasso
+```{r Lasso, echo=TRUE}
+# Load in data sets 
+train_df = read_csv("train.csv")
+test_df = read_csv("test.csv")
+
+# Bind (stack) the training and testing datasets
+full_df = bind_rows(train_df, test_df)
+
+# Define the indices of our training and testing datasets (within full_df)
+# We put our TRAINING dataset first, so the first N rows are training
+indices_train = 1:nrow(train_df)
+# The rest of the rows (after the first N) are from the testing data
+indices_test = tail(1:nrow(full_df), nrow(test_df))
+
+# Define our custom split object
+our_split = make_splits(
+    ind = list(analysis = indices_train, assessment = indices_test),
+    data = full_df)
+
+# Grab the training and testing subsets (again)
+sales_train = our_split %>% training()
+sales_test = our_split %>% testing()
+
+# Define the recipe
+sales_recipe = 
+    recipe(SalePrice ~ ., data = sales_train) %>%
+    # Update the role of 'Id'
+    update_role("Id", new_role = "id variable") %>%
+    # Remove the 'utilities' variable
+    step_rm(contains("Utilities")) %>%
+    # Mean imputation for numeric predictors
+    step_meanimpute(all_predictors() & all_numeric()) %>% 
+    # Create dummies for categorical variables
+    step_dummy(all_predictors() & all_nominal()) %>%
+    # KNN imputation for categorical predictors
+    step_knnimpute(all_predictors(), neighbors = 25) %>%
+    # Standardize
+    step_normalize(all_predictors() & all_numeric()) %>%
+    # Remove low-variance, highly correlated, or linearly dependent predictors
+    step_nzv(all_predictors()) %>% 
+    step_corr(all_predictors()) %>% 
+    step_lincomb(all_predictors())
+
+# Define the lasso regression model (with 'glmnet' engine)
+sales_lasso =
+    linear_reg(penalty = tune(), mixture = 1) %>%
+    set_mode("regression") %>%
+    set_engine("glmnet", standardize = F)
+
+# Define the 10-fold cross-validation splits
+set.seed(6)
+sales_cv = sales_train %>% vfold_cv(v = 10)
+
+# Define the workflow
+sales_workflow = 
+    workflow() %>%
+    add_model(sales_lasso) %>%
+    add_recipe(sales_recipe)
+
+# Tune the lasso penalty
+sales_tune = 
+    sales_workflow %>%
+    tune_grid(
+        sales_cv,
+        grid = data.frame(penalty = c(10^seq(20, -20, length.out = 125), 0)),
+        metrics = metric_set(rmse))
+
+# Finalize the model with the best model
+sales_final = 
+    sales_workflow %>%
+    finalize_workflow(select_best(sales_tune, metric = "rmse"))
+
+# Fit the final model on the full training set and predict on the test set
+sales_final_fit = sales_final %>% last_fit(our_split)
+
+# Collect the predictions
+sales_predictions = sales_final_fit %>% collect_predictions()
+
+# Create the submission dataset
+submit_lasso = data.frame(
+    Id = full_df$Id[sales_predictions$.row],
+    SalePrice = sales_predictions$.pred)
+
+# Save the dataset
+write_csv(x = submit_lasso,
+    file = "Andy-C-submit_lasso.csv")
+```
+
+# Ridge
+```{r Ridge, echo=TRUE}
+# Define the ridge regression model (with 'glmnet' engine)
+sales_ridge =
+    linear_reg(penalty = tune(), mixture = 0) %>%
+    set_mode("regression") %>%
+    set_engine("glmnet", standardize = F)
+
+# Define the workflow
+ridge_workflow = 
+    workflow() %>%
+    add_model(sales_ridge) %>%
+    add_recipe(sales_recipe)
+
+# Tune the lasso penalty
+ridge_tune = 
+    ridge_workflow %>%
+    tune_grid(
+        sales_cv,
+        grid = data.frame(penalty = c(10^seq(-10, -10, length.out = 25), 0)),
+        metrics = metric_set(rmse))
+
+# Finalize the model with the best model
+ridge_final = 
+    ridge_workflow %>%
+    finalize_workflow(select_best(ridge_tune, metric = "rmse"))
+
+# Fit the final model on the full training set and predict on the test set
+sales_final_ridge = ridge_final %>% last_fit(our_split)
+
+# Collect the predictions
+sales_ridge_predictions = sales_final_ridge %>% collect_predictions()
+
+# Create the submission dataset
+submit_ridge = data.frame(
+    Id = full_df$Id[sales_predictions$.row],
+    SalePrice = sales_predictions$.pred)
+
+# Save the dataset
+write_csv(x = submit_ridge,
+    file = "Andy-C-submit_ridge.csv")
+```
+
+# Elasticnet
+```{r Elasticnet, echo=TRUE}
+# Define the elasticnet regression model (with 'glmnet' engine)
+sales_elasticnet =
+    linear_reg(penalty = tune(), mixture = tune()) %>%
+    set_mode("regression") %>%
+    set_engine("glmnet")
+
+# Define the workflow
+elasticnet_workflow = 
+    workflow() %>%
+    add_model(sales_elasticnet) %>%
+    add_recipe(sales_recipe)
+
+# Tune the elasticnet penalty
+elasticnet_tune = 
+    elasticnet_workflow %>%
+    tune_grid(
+        sales_cv,
+        grid = grid_regular(mixture(), penalty(), levels = 10:10),
+        metrics = metric_set(rmse))
+
+# Finalize the model with the best model
+elasticnet_final = 
+    elasticnet_workflow %>%
+    finalize_workflow(select_best(elasticnet_tune, metric = "rmse"))
+
+# Fit the final model on the full training set and predict on the test set
+sales_final_elasticnet = elasticnet_final %>% last_fit(our_split)
+
+# Collect the predictions
+sales_elasticnet_predictions = sales_final_elasticnet %>% collect_predictions()
+
+# Create the submission dataset
+submit_elasticnet = data.frame(
+    Id = full_df$Id[sales_predictions$.row],
+    SalePrice = sales_predictions$.pred)
+
+# Save the dataset
+write_csv(x = submit_ridge,
+    file = "Andy-C-submit_elasticnet.csv")
+```
+
+# Reflection 
+
+Which models are most flexible? Explain your answer.
+
+The most flexible models are the ones with the lower mean squared errors because they overfit and produce less accurate predictios of sale price. I think my LM model is the most flexible so far. 
+
+Compare the models' performances. Any surprises?
+
+I am always surprised when coding, especially with how accurate the three new models we learned are when utilized correctly. My LM model just did so much better than last time, 0.163. I am so happy about that. I learned that we have to create dummies and impute onto the submission set as well as the training and test sets. LM did better than the Lasso regression, the Ridge and the Elasticnet.  
+
+Do the penalized models select similar variables to those that you selected? Do they 'select' similar models to each other?
+
+They select similar variables but include more variables than my linear regression. I think increasing the magnitude of the Lambda to increase the penalty for less variance would make their predictions better. If I could figure out how to do that, I would. 
+
+What are the values of the "best" (using CV performance) hyperparameters (penalty and mixture)? What does this tell you about the tradeoff between ridge and lasso in this predition problem?
+
+Ridge penalizes variance and so does Lasso, except Lasso never reaches zero while ridge regression does. 
+
+What is the most interesting/surprising thing you learned in this penalized-regression assignment?
+
+The most surprising thing that I learned was that the LM model is still the best, I am not sure if I am doing something wrong but linear models are tried and true. I am also realizing I really liked Professor Davis' class on causality, I thought prediction would be my favorite but I guess the grass is always greener eh? 
+
+# Briefly summarize what you learned from the prediction-policy problems paper:
+
+I learned the key differences between causal inference and prediction estimators are. For example, causality needs to account for ommited variables bias while preiction does not. Causality looks at the link between rain dances and it raining while prediction looks at if it is cloudy what is the probability it will rain. 
+
+What was the point?
+
+The point was that prediction pollicy problems deserve more attention from economists and require theoretical and practical understandings of the framework that outlines machine learning. They have the ability to help us understand policy implications and problems as causal inference has in the past, especially with advances in machine learning. 
+
+What new things did you learn?
+
+A new thing I learned is that we often think we can only predict what we are able to imagine that we can predict. While we may be able to predict even more with machine learning that we did not think we could predict before. 
+
+How might you apply it to topics that interest you?
+
+I could apply this to study the potential otucomes of public land usage incentives or estimated royalties on public land resource use through prediction estimators. 
+
+## Find an article/blog describing an interesting ML application.
+
+Describe the prediction problem.
+
+The prediction problem they are trying to understand is classifying individuals into low and high risk groups, probability of survivability and probabilities of reoccurence.  
+
+Which ML methods/techniques were used?
+
+"A variety of these techniques, including Artificial Neural Networks (ANNs), Bayesian Networks (BNs), Support Vector Machines (SVMs) and Decision Trees (DTs) have been widely applied in cancer research for the development of predictive models, resulting in effective and accurate decision making." 
+
+How did they avoid overfitting?
+
+"The bias component of a particular learning algorithm measures the error rate of that algorithm. Addition-ally, a second source of error over all possible training sets of given size and all possible test sets is called variance of the learning method. Theoverall expected error of a classification model is constituted of the sum of bias and variance, namely the bias–variance decomposition." They tried to minimize the bias-variance decomposition. 
+
+Include a link, the title, and the author/organization's name.
+
+https://www.sciencedirect.com/science/article/pii/S2001037014000464
+
+Title: Machine learning applications in cancer prognosis and prediction
+
+Computational and Structural Biotechnology Journal within Science Direct 
